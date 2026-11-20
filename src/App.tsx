@@ -1,52 +1,48 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Peer, { type DataConnection } from 'peerjs'
 import { QRCodeSVG } from 'qrcode.react'
+import type { FaceLandmarker } from '@mediapipe/tasks-vision'
 
-// 位置とサイズは映像の幅・高さに対する % で持つ（表示サイズが変わってもずれない）
-type Box = { x: number; y: number; w: number; h: number; score: number }
+// ===== お菓子キャッチゲームの設定 =====
+const SNACK_EMOJIS = ['🍪', '🍩', '🍫', '🍬', '🍭', '🍿', '🍓', '🍙']
+const SPAWN_MS = 1200 // お菓子が出てくる間隔
+const RISE_MS = 4000 // 下から上まで移動する時間（index.css の snackRise と同じ動き）
+const MOUTH_OPEN_RATIO = 0.07 // 唇のすき間 ÷ 顔の高さ がこれ以上なら「口が開いている」
+const CATCH_RADIUS = 0.3 // 口からこの距離（顔の高さ × 0.3）以内のお菓子を食べられる
 
-// メガネ検出（OWL-ViT）は Web Worker 1つで動かし、全VideoPanelで共有する
-let glassesWorker: Worker | null = null
-let glassesReadyPromise: Promise<void> | null = null
-let nextRequestId = 0
-const pendingRequests = new Map<number, (boxes: Box[]) => void>()
-
-function loadGlassesModel() {
-  if (!glassesReadyPromise) {
-    glassesReadyPromise = new Promise((resolve, reject) => {
-      const worker = new Worker(new URL('./glassesWorker.ts', import.meta.url), {
-        type: 'module',
-      })
-      glassesWorker = worker
-      worker.onmessage = (e) => {
-        const msg = e.data
-        if (msg.type === 'ready') resolve()
-        if (msg.type === 'error') reject(new Error(msg.message))
-        if (msg.type === 'result') {
-          if (msg.error) console.error('メガネ検出エラー:', msg.error)
-          pendingRequests.get(msg.id)?.(msg.boxes)
-          pendingRequests.delete(msg.id)
-        }
-      }
-      worker.onerror = (e) => reject(new Error(e.message || 'worker error'))
-    })
-  }
-  return glassesReadyPromise
+// お菓子の縦位置（%）。CSS の snackRise（top: 110% → -10%）と同じ計算
+function snackY(born: number, now: number) {
+  return 110 - (120 * (now - born)) / RISE_MS
 }
 
-async function detectGlasses(video: HTMLVideoElement): Promise<Box[]> {
-  if (!glassesWorker) return []
-  // 映像の1コマを幅640pxに縮小して Worker に渡す
-  const scale = Math.min(1, 640 / video.videoWidth)
-  const bitmap = await createImageBitmap(video, {
-    resizeWidth: Math.round(video.videoWidth * scale),
-    resizeHeight: Math.round(video.videoHeight * scale),
-  })
-  const id = nextRequestId++
-  return new Promise((resolve) => {
-    pendingRequests.set(id, resolve)
-    glassesWorker!.postMessage({ type: 'detect', id, bitmap }, [bitmap])
-  })
+// 顔のランドマーク検出（MediaPipe）は1回だけ読み込み、全VideoPanelで共有する
+// package.json のバージョンと同じ番号にすること
+const MEDIAPIPE_VERSION = '1.2.3'
+const FACE_MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+
+let landmarkerPromise: Promise<FaceLandmarker> | null = null
+function loadFaceLandmarker() {
+  if (!landmarkerPromise) {
+    landmarkerPromise = (async () => {
+      const vision = await import('@mediapipe/tasks-vision')
+      const fileset = await vision.FilesetResolver.forVisionTasks(
+        `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`
+      )
+      const create = (delegate: 'GPU' | 'CPU') =>
+        vision.FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: FACE_MODEL_URL, delegate },
+          runningMode: 'IMAGE', // 複数のスマホ映像で共有するので IMAGE モード
+          numFaces: 1,
+        })
+      try {
+        return await create('GPU')
+      } catch {
+        return create('CPU') // GPU が使えないPC用
+      }
+    })()
+  }
+  return landmarkerPromise
 }
 
 function Smartphone({ hostId }: { hostId: string }) {
@@ -54,7 +50,7 @@ function Smartphone({ hostId }: { hostId: string }) {
   const connRef = useRef<DataConnection | null>(null)
   const [cameraSettings, setCameraSettings] = useState<MediaTrackSettings | null>(null)
   const [message, setMessage] = useState('ドン！')
-  const [glassesCount, setGlassesCount] = useState<number | null>(null)
+  const [snackCount, setSnackCount] = useState<number | null>(null)
 
   useEffect(() => {
     let stream: MediaStream | null = null
@@ -69,10 +65,10 @@ function Smartphone({ hostId }: { hostId: string }) {
           connRef.current = conn
           conn.send('接続完了!')
         })
-        // PCから届くメガネの数 { glasses: N }
+        // PCから届く食べたお菓子の数 { snacks: N }
         conn.on('data', (data) => {
-          if (data && typeof data === 'object' && 'glasses' in data) {
-            setGlassesCount(Number(data.glasses))
+          if (data && typeof data === 'object' && 'snacks' in data) {
+            setSnackCount(Number(data.snacks))
           }
         })
         conn.on('close', () => {
@@ -136,8 +132,8 @@ function Smartphone({ hostId }: { hostId: string }) {
         <p className="mb-4 break-all">
           接続先PC：{hostId}
         </p>
-        {glassesCount !== null && (
-          <p className="mb-4 font-bold">👓 ×{glassesCount}</p>
+        {snackCount !== null && (
+          <p className="mb-4 font-bold">🍪 ×{snackCount}</p>
         )}
       </div>
       <input
@@ -162,12 +158,15 @@ function Smartphone({ hostId }: { hostId: string }) {
   )
 }
 
+type Snack = { id: number; emoji: string; x: number; born: number }
+type Mouth = { x: number; y: number; r: number; open: boolean }
+
 function VideoPanel({
   peerId,
   stream,
   effects,
-  glassesReady,
-  onGlassesCount,
+  landmarker,
+  onSnackCount,
 }: {
   peerId: string
   stream: MediaStream
@@ -178,11 +177,15 @@ function VideoPanel({
     x: number
     y: number
   }[]
-  glassesReady: boolean
-  onGlassesCount: (peerId: string, streamId: string, count: number) => void
+  landmarker: FaceLandmarker | null
+  onSnackCount: (peerId: string, streamId: string, count: number) => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const [glasses, setGlasses] = useState<Box[]>([])
+  const snacksRef = useRef<Snack[]>([])
+  const [snacks, setSnacks] = useState<Snack[]>([])
+  const [mouth, setMouth] = useState<Mouth | null>(null)
+  const [score, setScore] = useState(0)
+  const [pops, setPops] = useState<{ id: number; x: number; y: number }[]>([])
 
   useEffect(() => {
     if (videoRef.current) {
@@ -191,43 +194,94 @@ function VideoPanel({
     }
   }, [stream])
 
-  // メガネは重いモデルなので1.5秒ごと（前の検出が終わるまで次は始めない）
-  // スマホが切断されてVideoPanelが消えたらタイマーを止める
+  // ゲーム: お菓子を出す + 口の位置を調べて、口が開いていたら近くのお菓子を食べる
   useEffect(() => {
-    if (!glassesReady) return
-    let cancelled = false
-    let busy = false
-    let lastCount = -1
+    if (!landmarker) return
+    let total = 0
+    let nextId = 0
 
-    const timer = setInterval(async () => {
+    function updateSnacks(list: Snack[]) {
+      snacksRef.current = list
+      setSnacks(list)
+    }
+
+    // 一定間隔で下から新しいお菓子を出す（上まで行ったものは消す）
+    const spawnTimer = setInterval(() => {
+      const now = Date.now()
+      updateSnacks([
+        ...snacksRef.current.filter((s) => now - s.born < RISE_MS),
+        {
+          id: nextId++,
+          emoji: SNACK_EMOJIS[Math.floor(Math.random() * SNACK_EMOJIS.length)],
+          x: 10 + Math.random() * 80,
+          born: now,
+        },
+      ])
+    }, SPAWN_MS)
+
+    // 約15回/秒 口を調べる
+    const detectTimer = setInterval(() => {
       const video = videoRef.current
-      if (busy || !video || video.readyState < 2 || video.videoWidth === 0) {
+      if (!video || video.readyState < 2 || video.videoWidth === 0) return
+
+      let face
+      try {
+        face = landmarker.detect(video).faceLandmarks[0]
+      } catch (err) {
+        console.error('顔検出エラー:', err)
         return
       }
-      busy = true
-      try {
-        const found = await detectGlasses(video)
-        if (cancelled) return
-        setGlasses(found)
-        if (found.length !== lastCount) {
-          lastCount = found.length
-          onGlassesCount(peerId, stream.id, found.length)
-        }
-      } catch (err) {
-        console.error('メガネ検出エラー:', err)
-      } finally {
-        busy = false
+      if (!face) {
+        setMouth(null)
+        return
       }
-    }, 1500)
 
+      // ランドマーク番号: 13=上唇の内側, 14=下唇の内側, 10=おでこ, 152=あご
+      const W = video.videoWidth
+      const H = video.videoHeight
+      const upper = { x: face[13].x * W, y: face[13].y * H }
+      const lower = { x: face[14].x * W, y: face[14].y * H }
+      const faceHeight = Math.hypot(
+        (face[152].x - face[10].x) * W,
+        (face[152].y - face[10].y) * H
+      )
+      const gap = Math.hypot(lower.x - upper.x, lower.y - upper.y)
+      const open = gap / faceHeight > MOUTH_OPEN_RATIO
+      const mx = (upper.x + lower.x) / 2
+      const my = (upper.y + lower.y) / 2
+      const radius = faceHeight * CATCH_RADIUS
+
+      setMouth({ x: (mx / W) * 100, y: (my / H) * 100, r: (radius / W) * 100, open })
+      if (!open) return
+
+      const now = Date.now()
+      const caught = snacksRef.current.filter((s) => {
+        const sx = (s.x / 100) * W
+        const sy = (snackY(s.born, now) / 100) * H
+        return Math.hypot(sx - mx, sy - my) < radius
+      })
+      if (caught.length === 0) return
+
+      updateSnacks(snacksRef.current.filter((s) => !caught.includes(s)))
+      total += caught.length
+      setScore(total)
+      onSnackCount(peerId, stream.id, total)
+      // 食べた場所に「+1」を浮かべる（floatUp アニメーションを再利用）
+      setPops((prev) => [
+        ...prev.filter((p) => now - p.id < 1000),
+        ...caught.map((s, i) => ({ id: now + i / 100, x: s.x, y: snackY(s.born, now) })),
+      ])
+    }, 66)
+
+    // スマホが切断されてVideoPanelが消えたらタイマーを止める
     return () => {
-      cancelled = true
-      clearInterval(timer)
+      clearInterval(spawnTimer)
+      clearInterval(detectTimer)
     }
-  }, [glassesReady, stream, peerId, onGlassesCount])
+  }, [landmarker, stream, peerId, onSnackCount])
 
   return (
-    <div className="relative [container-type:inline-size]">
+    <div className="relative overflow-hidden rounded [container-type:inline-size]">
       <video
         ref={videoRef}
         autoPlay
@@ -236,26 +290,38 @@ function VideoPanel({
         className="block w-full rounded bg-black"
       />
 
-      {glasses.map((g, i) => (
-        <div
-          key={i}
-          className="pointer-events-none absolute border-2 border-cyan-400"
-          style={{
-            left: `${g.x}%`,
-            top: `${g.y}%`,
-            width: `${g.w}%`,
-            height: `${g.h}%`,
-          }}
+      {snacks.map((snack) => (
+        <span
+          key={snack.id}
+          className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 animate-[snackRise_4s_linear_forwards] text-[8cqw]"
+          style={{ left: `${snack.x}%` }}
         >
-          <span className="absolute top-0 left-0 bg-cyan-400 px-1 text-[10px] font-bold whitespace-nowrap text-black">
-            glasses {Math.round(g.score * 100)}%
-          </span>
-        </div>
+          {snack.emoji}
+        </span>
       ))}
 
-      {glassesReady && (
+      {mouth && (
+        <div
+          className={`pointer-events-none absolute aspect-square -translate-x-1/2 -translate-y-1/2 rounded-full border-2 ${
+            mouth.open ? 'border-green-400 bg-green-400/20' : 'border-white/60'
+          }`}
+          style={{ left: `${mouth.x}%`, top: `${mouth.y}%`, width: `${mouth.r * 2}%` }}
+        />
+      )}
+
+      {pops.map((pop) => (
+        <span
+          key={pop.id}
+          className="pointer-events-none absolute animate-[floatUp_1s_ease-out_forwards] text-[5cqw] font-black text-yellow-300"
+          style={{ left: `${pop.x}%`, bottom: `${100 - pop.y}%` }}
+        >
+          +1
+        </span>
+      ))}
+
+      {landmarker && (
         <div className="pointer-events-none absolute top-2 left-2 rounded bg-black/60 px-2 py-1 text-sm font-bold text-white">
-          👓 ×{glasses.length}
+          🍪 ×{score}
         </div>
       )}
 
@@ -283,26 +349,26 @@ function App() {
   const [effects, setEffects] = useState<
     { id: number; peerId: string; text: string; x: number; y: number }[]
   >([])
-  const [glassesReady, setGlassesReady] = useState(false)
-  const [glassesError, setGlassesError] = useState<string | null>(null)
-  // key: stream.id, value: 今映っているメガネの数
-  const [glassesCounts, setGlassesCounts] = useState<Record<string, number>>({})
+  const [landmarker, setLandmarker] = useState<FaceLandmarker | null>(null)
+  const [landmarkerError, setLandmarkerError] = useState<string | null>(null)
+  // key: stream.id, value: 食べたお菓子の数
+  const [snackCounts, setSnackCounts] = useState<Record<string, number>>({})
   // key: スマホのpeer ID（数をスマホへ送り返すため）
   const connectionsRef = useRef(new Map<string, DataConnection>())
 
   const smartphoneUrl = `${window.location.origin}${import.meta.env.BASE_URL}?host=${peerId}`
 
-  const totalGlasses = videos.reduce(
-    (sum, video) => sum + (glassesCounts[video.stream.id] ?? 0),
+  const totalSnacks = videos.reduce(
+    (sum, video) => sum + (snackCounts[video.stream.id] ?? 0),
     0
   )
 
-  const handleGlassesCount = useCallback(
+  const handleSnackCount = useCallback(
     (phonePeerId: string, streamId: string, count: number) => {
-      setGlassesCounts((prev) => ({ ...prev, [streamId]: count }))
+      setSnackCounts((prev) => ({ ...prev, [streamId]: count }))
       const conn = connectionsRef.current.get(phonePeerId)
       if (conn && conn.open) {
-        conn.send({ glasses: count })
+        conn.send({ snacks: count })
       }
     },
     []
@@ -310,13 +376,13 @@ function App() {
 
   useEffect(() => {
     let active = true
-    loadGlassesModel()
-      .then(() => {
-        if (active) setGlassesReady(true)
+    loadFaceLandmarker()
+      .then((loaded) => {
+        if (active) setLandmarker(loaded)
       })
       .catch((err) => {
-        console.error('メガネモデルの読み込みに失敗しました', err)
-        if (active) setGlassesError(err instanceof Error ? err.message : String(err))
+        console.error('顔検出モデルの読み込みに失敗しました', err)
+        if (active) setLandmarkerError(err instanceof Error ? err.message : String(err))
       })
     return () => {
       active = false
@@ -397,14 +463,12 @@ function App() {
       <p>PCのPeer ID：<span className="mt-2 break-all rounded bg-white p-4">
         {peerId || '接続待機中...'}
       </span></p>
-      {!glassesReady && !glassesError && (
-        <p className="mt-4 text-sm text-gray-600">
-          Loading glasses model... (about 155 MB the first time)
-        </p>
+      {!landmarker && !landmarkerError && (
+        <p className="mt-4 text-sm text-gray-600">Loading face model...</p>
       )}
-      {glassesError && (
+      {landmarkerError && (
         <p className="mt-4 text-sm text-red-600">
-          Glasses detection is not available (model failed to load): {glassesError}
+          Snack game is not available (face model failed to load): {landmarkerError}
         </p>
       )}
       {peerId && (
@@ -426,7 +490,7 @@ function App() {
             接続中のスマホ：{videos.length}台
           </h2>
           <h2 className="mt-8 mb-4 text-xl font-bold">
-            Total glasses: {totalGlasses}
+            Total snacks: {totalSnacks}
           </h2>
         </div>
       )}
@@ -438,8 +502,8 @@ function App() {
             peerId={video.peerId}
             stream={video.stream}
             effects={effects.filter((effect) => effect.peerId === video.peerId)}
-            glassesReady={glassesReady}
-            onGlassesCount={handleGlassesCount}
+            landmarker={landmarker}
+            onSnackCount={handleSnackCount}
           />
         ))}
       </div>
