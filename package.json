@@ -12,8 +12,6 @@
   "dependencies": {
     "@huggingface/transformers": "^4.3.2",
     "@tailwindcss/vite": "^4.3.5",
-    "@tensorflow-models/coco-ssd": "^2.2.3",
-    "@tensorflow/tfjs": "^4.22.0",
     "peerjs": "^1.5.5",
     "qrcode.react": "^4.2.0",
     "react": "^19.3.1",

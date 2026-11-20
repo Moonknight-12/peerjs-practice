@@ -1,28 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Peer, { type DataConnection } from 'peerjs'
 import { QRCodeSVG } from 'qrcode.react'
-import type { ObjectDetection } from '@tensorflow-models/coco-ssd'
-
-// コップ検出モデル（COCO-SSD）は1回だけ読み込み、全VideoPanelで共有する
-// TensorFlowは重いので、PC画面でだけ動的importする（スマホ画面は軽いまま）
-let modelPromise: Promise<ObjectDetection> | null = null
-function loadCupModel() {
-  if (!modelPromise) {
-    modelPromise = (async () => {
-      const [tf, cocoSsd] = await Promise.all([
-        import('@tensorflow/tfjs'),
-        import('@tensorflow-models/coco-ssd'),
-      ])
-      await tf.ready()
-      return cocoSsd.load()
-    })()
-  }
-  return modelPromise
-}
 
 // 位置とサイズは映像の幅・高さに対する % で持つ（表示サイズが変わってもずれない）
 type Box = { x: number; y: number; w: number; h: number; score: number }
-type CountKind = 'cups' | 'glasses'
 
 // メガネ検出（OWL-ViT）は Web Worker 1つで動かし、全VideoPanelで共有する
 let glassesWorker: Worker | null = null
@@ -73,7 +54,6 @@ function Smartphone({ hostId }: { hostId: string }) {
   const connRef = useRef<DataConnection | null>(null)
   const [cameraSettings, setCameraSettings] = useState<MediaTrackSettings | null>(null)
   const [message, setMessage] = useState('ドン！')
-  const [cupCount, setCupCount] = useState<number | null>(null)
   const [glassesCount, setGlassesCount] = useState<number | null>(null)
 
   useEffect(() => {
@@ -89,11 +69,10 @@ function Smartphone({ hostId }: { hostId: string }) {
           connRef.current = conn
           conn.send('接続完了!')
         })
-        // PCから届く数 { cups: N } または { glasses: N }
+        // PCから届くメガネの数 { glasses: N }
         conn.on('data', (data) => {
-          if (data && typeof data === 'object') {
-            if ('cups' in data) setCupCount(Number(data.cups))
-            if ('glasses' in data) setGlassesCount(Number(data.glasses))
+          if (data && typeof data === 'object' && 'glasses' in data) {
+            setGlassesCount(Number(data.glasses))
           }
         })
         conn.on('close', () => {
@@ -157,9 +136,6 @@ function Smartphone({ hostId }: { hostId: string }) {
         <p className="mb-4 break-all">
           接続先PC：{hostId}
         </p>
-        {cupCount !== null && (
-          <p className="mb-4 font-bold">☕ ×{cupCount}</p>
-        )}
         {glassesCount !== null && (
           <p className="mb-4 font-bold">👓 ×{glassesCount}</p>
         )}
@@ -190,9 +166,8 @@ function VideoPanel({
   peerId,
   stream,
   effects,
-  model,
   glassesReady,
-  onCount,
+  onGlassesCount,
 }: {
   peerId: string
   stream: MediaStream
@@ -203,12 +178,10 @@ function VideoPanel({
     x: number
     y: number
   }[]
-  model: ObjectDetection | null
   glassesReady: boolean
-  onCount: (peerId: string, streamId: string, kind: CountKind, count: number) => void
+  onGlassesCount: (peerId: string, streamId: string, count: number) => void
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const [cups, setCups] = useState<Box[]>([])
   const [glasses, setGlasses] = useState<Box[]>([])
 
   useEffect(() => {
@@ -218,51 +191,8 @@ function VideoPanel({
     }
   }, [stream])
 
-  // 500msごとにコップを検出する（毎フレームではない）
-  useEffect(() => {
-    if (!model) return
-    let cancelled = false
-    let busy = false
-    let lastCount = -1
-
-    const timer = setInterval(async () => {
-      const video = videoRef.current
-      if (busy || !video || video.readyState < 2 || video.videoWidth === 0) {
-        return
-      }
-      busy = true
-      try {
-        const predictions = await model.detect(video)
-        if (cancelled) return
-        const found = predictions
-          .filter((p) => p.class === 'cup' && p.score >= 0.5)
-          .map((p) => ({
-            x: (p.bbox[0] / video.videoWidth) * 100,
-            y: (p.bbox[1] / video.videoHeight) * 100,
-            w: (p.bbox[2] / video.videoWidth) * 100,
-            h: (p.bbox[3] / video.videoHeight) * 100,
-            score: p.score,
-          }))
-        setCups(found)
-        if (found.length !== lastCount) {
-          lastCount = found.length
-          onCount(peerId, stream.id, 'cups', found.length)
-        }
-      } catch (err) {
-        console.error('検出エラー:', err)
-      } finally {
-        busy = false
-      }
-    }, 500)
-
-    // スマホが切断されてVideoPanelが消えたらタイマーを止める
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
-  }, [model, stream, peerId, onCount])
-
   // メガネは重いモデルなので1.5秒ごと（前の検出が終わるまで次は始めない）
+  // スマホが切断されてVideoPanelが消えたらタイマーを止める
   useEffect(() => {
     if (!glassesReady) return
     let cancelled = false
@@ -281,7 +211,7 @@ function VideoPanel({
         setGlasses(found)
         if (found.length !== lastCount) {
           lastCount = found.length
-          onCount(peerId, stream.id, 'glasses', found.length)
+          onGlassesCount(peerId, stream.id, found.length)
         }
       } catch (err) {
         console.error('メガネ検出エラー:', err)
@@ -294,7 +224,7 @@ function VideoPanel({
       cancelled = true
       clearInterval(timer)
     }
-  }, [glassesReady, stream, peerId, onCount])
+  }, [glassesReady, stream, peerId, onGlassesCount])
 
   return (
     <div className="relative [container-type:inline-size]">
@@ -306,26 +236,9 @@ function VideoPanel({
         className="block w-full rounded bg-black"
       />
 
-      {cups.map((cup, i) => (
-        <div
-          key={`cup-${i}`}
-          className="pointer-events-none absolute border-2 border-yellow-400"
-          style={{
-            left: `${cup.x}%`,
-            top: `${cup.y}%`,
-            width: `${cup.w}%`,
-            height: `${cup.h}%`,
-          }}
-        >
-          <span className="absolute top-0 left-0 bg-yellow-400 px-1 text-[10px] font-bold whitespace-nowrap text-black">
-            cup {Math.round(cup.score * 100)}%
-          </span>
-        </div>
-      ))}
-
       {glasses.map((g, i) => (
         <div
-          key={`glasses-${i}`}
+          key={i}
           className="pointer-events-none absolute border-2 border-cyan-400"
           style={{
             left: `${g.x}%`,
@@ -340,10 +253,9 @@ function VideoPanel({
         </div>
       ))}
 
-      {(model || glassesReady) && (
-        <div className="pointer-events-none absolute top-2 left-2 flex gap-2 rounded bg-black/60 px-2 py-1 text-sm font-bold text-white">
-          {model && <span>☕ ×{cups.length}</span>}
-          {glassesReady && <span>👓 ×{glasses.length}</span>}
+      {glassesReady && (
+        <div className="pointer-events-none absolute top-2 left-2 rounded bg-black/60 px-2 py-1 text-sm font-bold text-white">
+          👓 ×{glasses.length}
         </div>
       )}
 
@@ -371,35 +283,26 @@ function App() {
   const [effects, setEffects] = useState<
     { id: number; peerId: string; text: string; x: number; y: number }[]
   >([])
-  const [model, setModel] = useState<ObjectDetection | null>(null)
-  const [modelError, setModelError] = useState<string | null>(null)
   const [glassesReady, setGlassesReady] = useState(false)
   const [glassesError, setGlassesError] = useState<string | null>(null)
-  // key: stream.id, value: 今映っているコップ・メガネの数
-  const [counts, setCounts] = useState<
-    Record<string, Partial<Record<CountKind, number>>>
-  >({})
+  // key: stream.id, value: 今映っているメガネの数
+  const [glassesCounts, setGlassesCounts] = useState<Record<string, number>>({})
   // key: スマホのpeer ID（数をスマホへ送り返すため）
   const connectionsRef = useRef(new Map<string, DataConnection>())
 
   const smartphoneUrl = `${window.location.origin}${import.meta.env.BASE_URL}?host=${peerId}`
 
-  function total(kind: CountKind) {
-    return videos.reduce(
-      (sum, video) => sum + (counts[video.stream.id]?.[kind] ?? 0),
-      0
-    )
-  }
+  const totalGlasses = videos.reduce(
+    (sum, video) => sum + (glassesCounts[video.stream.id] ?? 0),
+    0
+  )
 
-  const handleCount = useCallback(
-    (phonePeerId: string, streamId: string, kind: CountKind, count: number) => {
-      setCounts((prev) => ({
-        ...prev,
-        [streamId]: { ...prev[streamId], [kind]: count },
-      }))
+  const handleGlassesCount = useCallback(
+    (phonePeerId: string, streamId: string, count: number) => {
+      setGlassesCounts((prev) => ({ ...prev, [streamId]: count }))
       const conn = connectionsRef.current.get(phonePeerId)
       if (conn && conn.open) {
-        conn.send({ [kind]: count })
+        conn.send({ glasses: count })
       }
     },
     []
@@ -407,14 +310,6 @@ function App() {
 
   useEffect(() => {
     let active = true
-    loadCupModel()
-      .then((loaded) => {
-        if (active) setModel(loaded)
-      })
-      .catch((err) => {
-        console.error('モデルの読み込みに失敗しました', err)
-        if (active) setModelError(err instanceof Error ? err.message : String(err))
-      })
     loadGlassesModel()
       .then(() => {
         if (active) setGlassesReady(true)
@@ -502,21 +397,13 @@ function App() {
       <p>PCのPeer ID：<span className="mt-2 break-all rounded bg-white p-4">
         {peerId || '接続待機中...'}
       </span></p>
-      {!model && !modelError && (
-        <p className="mt-4 text-sm text-gray-600">Loading model...</p>
-      )}
-      {modelError && (
-        <p className="mt-4 text-sm text-red-600">
-          Cup detection is not available (model failed to load): {modelError}
-        </p>
-      )}
       {!glassesReady && !glassesError && (
-        <p className="mt-1 text-sm text-gray-600">
+        <p className="mt-4 text-sm text-gray-600">
           Loading glasses model... (about 155 MB the first time)
         </p>
       )}
       {glassesError && (
-        <p className="mt-1 text-sm text-red-600">
+        <p className="mt-4 text-sm text-red-600">
           Glasses detection is not available (model failed to load): {glassesError}
         </p>
       )}
@@ -539,10 +426,7 @@ function App() {
             接続中のスマホ：{videos.length}台
           </h2>
           <h2 className="mt-8 mb-4 text-xl font-bold">
-            Total cups: {total('cups')}
-          </h2>
-          <h2 className="mt-8 mb-4 text-xl font-bold">
-            Total glasses: {total('glasses')}
+            Total glasses: {totalGlasses}
           </h2>
         </div>
       )}
@@ -554,9 +438,8 @@ function App() {
             peerId={video.peerId}
             stream={video.stream}
             effects={effects.filter((effect) => effect.peerId === video.peerId)}
-            model={model}
             glassesReady={glassesReady}
-            onCount={handleCount}
+            onGlassesCount={handleGlassesCount}
           />
         ))}
       </div>
