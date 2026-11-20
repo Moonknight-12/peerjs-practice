@@ -1,10 +1,21 @@
 // メガネ検出用の Web Worker
 // OWL-ViT（文字で探す物を指定できるモデル）は重いので、画面が固まらないよう別スレッドで動かす
 import {
+  env,
   pipeline,
   RawImage,
   type ZeroShotObjectDetectionPipeline,
 } from '@huggingface/transformers'
+
+// 標準の asyncify 版 WASM には、このモデルが使う Cast / Where の処理が入っていない
+// （"Could not find an implementation for Cast(13)" エラーになる）
+// そこで、全部の処理が入っている通常版 WASM を同じバージョンで読み込む
+const onnxWasm = env.backends.onnx.wasm!
+const ortCdn = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${env.backends.onnx.versions!.web}/dist/`
+onnxWasm.wasmPaths = {
+  mjs: `${ortCdn}ort-wasm-simd-threaded.mjs`,
+  wasm: `${ortCdn}ort-wasm-simd-threaded.wasm`,
+}
 
 type Request = { type: 'detect'; id: number; bitmap: ImageBitmap }
 
